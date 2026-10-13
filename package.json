@@ -1,0 +1,40 @@
+{
+  "name": "opencode-pre-tool-review",
+  "version": "0.1.0",
+  "description": "Pre-tool-use review hook for OpenCode: judge tool calls with a reviewer model inside the permission check, using OpenCode's native permission UI.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yehweihsu/opencode-pre-tool-review.git"
+  },
+  "homepage": "https://github.com/yehweihsu/opencode-pre-tool-review#readme",
+  "bugs": {
+    "url": "https://github.com/yehweihsu/opencode-pre-tool-review/issues"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "security",
+    "tool-permissions",
+    "agent"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --no-warnings test/plugin.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.0.27"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
