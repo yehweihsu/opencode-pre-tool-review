@@ -349,13 +349,26 @@ function hasContent(value: unknown): boolean {
   return true
 }
 
+/** Built-in shell actions stay classified as shell even when their whitelist is disabled. */
+function isShellAction(config: Config, action: string): boolean {
+  return DEFAULT_SHELL_ACTIONS.includes(action) || config.shellActions.has(action)
+}
+
+/** Only a recovered full command is usable; parsed permission resources are not a substitute. */
+function shellCommand(toolInput: unknown): string | undefined {
+  if (!isRecord(toolInput) || typeof toolInput.command !== "string" || !toolInput.command.trim()) return undefined
+  return toolInput.command
+}
+
 /**
  * Identity of one exact operation. Resources alone are not enough: an edit's resource is only the
  * file path and an MCP tool's resource is always "*", so the permission metadata (an edit's diff, a
  * fetch's input) and the tool input from the transcript are part of the identity too.
  *
  * `pinned` is false when nothing beyond the resources pins the operation down. Such an operation is
- * never offered a release, because a release could not be tied to that exact operation.
+ * never offered a release, because a release could not be tied to that exact operation. Shell
+ * resources may omit redirects and other syntax, so shell releases require a recovered command;
+ * neither resources nor arbitrary metadata establish a complete shell invocation.
  */
 async function operationIdentity(
   config: Config,
@@ -375,7 +388,9 @@ async function operationIdentity(
       stableStringify(toolInput),
     ].join("\u0000"),
   )
-  const pinned = toolInput !== undefined || hasContent(event.metadata) || config.shellActions.has(event.action)
+  const pinned = isShellAction(config, event.action)
+    ? shellCommand(toolInput) !== undefined
+    : toolInput !== undefined || hasContent(event.metadata)
   return { id, pinned }
 }
 
@@ -404,13 +419,20 @@ function isSimpleReadOnlyShell(config: Config, command: string): boolean {
   return config.shellVerbs.has(head)
 }
 
-function isWhitelisted(config: Config, action: string, resources: readonly string[]): boolean {
+function isWhitelisted(config: Config, action: string, resources: readonly string[], toolInput: unknown): boolean {
   if (resources.length === 0) return false
+  if (isShellAction(config, action)) {
+    if (!config.shellActions.has(action)) return false
+    const command = shellCommand(toolInput)
+    // OpenCode can report `pwd && cat > output file` as ["pwd", "cat"]. Only a
+    // recovered, single simple command matching its resource may skip review.
+    if (command === undefined || resources.length !== 1 || resources[0]?.trim() !== command.trim()) return false
+    // A relative filename may be harmless while its explicit working directory is sensitive.
+    if (isRecord(toolInput) && typeof toolInput.workdir === "string" && SENSITIVE.test(toolInput.workdir)) return false
+    return isSimpleReadOnlyShell(config, command)
+  }
   if (config.interactiveActions.has(action)) return true
   if (config.readOnlyActions.has(action)) return resources.every((resource) => !SENSITIVE.test(resource))
-  if (config.shellActions.has(action)) {
-    return resources.every((resource) => isSimpleReadOnlyShell(config, resource))
-  }
   return false
 }
 
@@ -427,12 +449,11 @@ function parseVerdict(text: string): { decision: Decision; description: string; 
   if (value.decision !== "allow" && value.decision !== "block" && value.decision !== "uncertain") {
     throw new Error("reviewer returned an invalid decision")
   }
-  const description =
-    typeof value.description === "string" && value.description.trim()
-      ? value.description.trim()
-      : "(no description)"
-  const reason =
-    typeof value.reason === "string" && value.reason.trim() ? value.reason.trim() : "(no reason)"
+  const description = typeof value.description === "string" ? value.description.trim() : ""
+  const reason = typeof value.reason === "string" ? value.reason.trim() : ""
+  if (value.decision !== "allow" && (!description || !reason)) {
+    throw new Error("reviewer returned a non-allow decision without a description and reason")
+  }
   return { decision: value.decision, description, reason }
 }
 
@@ -461,7 +482,8 @@ Use "allow" for ordinary calls consistent with what the user asked for.
 Use "block" when the action is destructive or irreversible over a broad scope, exposes secrets or credentials, sends data to an unexpected external destination, weakens security, or is clearly unrelated to the user's request.
 Use "uncertain" when you cannot tell whether the action is safe, including when its effect depends on something you cannot see.
 Permission metadata can contain the actual edit diff or other operation details; evaluate it together with the tool input. If data is missing or truncated and you cannot determine the full effect, use "uncertain".
-Always fill "description" when you do not allow. Never run the tool yourself.
+Always fill "description" and "reason" when you do not allow. Never run the tool yourself.
+${isShellAction(config, input.action) ? "This is a shell action. Permission resources may be parsed fragments that omit redirects, chaining and other effects. Judge the complete command in the recovered tool input, not just those fragments. If the full command is unavailable, use \"uncertain\"." : ""}
 
 ${languageDirective(config.language)}
 
@@ -734,14 +756,19 @@ export default Plugin.define({
       //    A reviewer can only tighten a decision, never relax one, so leave it alone.
       if (event.effect === "deny") return
 
+      // Shell resources can be incomplete: recover the full input BEFORE considering a whitelist.
+      // Reuse this snapshot for both review and identity. Non-shell whitelists need no transcript.
+      const shell = isShellAction(config, event.action)
+      let toolInput = shell ? await findToolInput(ctx, event) : undefined
+
       // 1. Whitelisted actions never reach the reviewer and keep their configured effect.
       try {
-        if (isWhitelisted(config, event.action, event.resources)) return
+        if (isWhitelisted(config, event.action, event.resources, toolInput)) return
       } catch {
         // Fall through to review.
       }
 
-      const toolInput = await findToolInput(ctx, event)
+      if (!shell) toolInput = await findToolInput(ctx, event)
       const { id, pinned } = await operationIdentity(config, idKey, projectID, event, toolInput)
       pruneReleases()
 

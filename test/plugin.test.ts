@@ -41,6 +41,16 @@ function editEvent(patch: string) {
   return { action: "edit", resources: ["src/a.ts"], metadata: { files: [{ file: "src/a.ts", patch, additions: 1, deletions: 0, status: "modified" }] } }
 }
 
+/** A permission event and the exact transcript input behind its source; never infer input from resources. */
+function shellFixture(input: unknown, resources: string[], action = "shell") {
+  return {
+    messages: [{ type: "assistant", id: "m1", content: [
+      { type: "tool", id: "t1", name: action, state: { status: "running", input } },
+    ] }],
+    event: { action, resources, source: { type: "tool", messageID: "m1", id: "t1" } },
+  }
+}
+
 function question(labels: string[], text = "Release? Deletes the whole build directory") {
   return { questions: [{ header: "Release", question: text, options: labels.map((label) => ({ label, description: "" })) }] }
 }
@@ -64,9 +74,10 @@ await test("earlier deny is left alone and not reviewed", async () => {
 })
 
 await test("whitelisted shell command skips review", async () => {
-  const { ctx, hooks, calls } = makeCtx()
+  const fixture = shellFixture({ command: "ls" }, ["ls"])
+  const { ctx, hooks, calls } = makeCtx({ messages: fixture.messages })
   await plugin.setup(ctx)
-  const ev = await evaluate(hooks, { action: "shell", resources: ["ls"] })
+  const ev = await evaluate(hooks, fixture.event)
   assert.equal(ev.effect, "allow"); assert.equal(calls.review, 0)
 })
 
@@ -84,9 +95,10 @@ await test("shell mutations and executable Git options always reach the reviewer
     "ls env:", "dir Env:", "type ENV~1", "git show HEAD:config.json",
   ]
   for (const command of commands) {
-    const { ctx, hooks, calls } = makeCtx({ verdicts: [BLOCK] })
+    const fixture = shellFixture({ command }, [command])
+    const { ctx, hooks, calls } = makeCtx({ messages: fixture.messages, verdicts: [BLOCK] })
     await plugin.setup(ctx)
-    const ev = await evaluate(hooks, { action: "shell", resources: [command] })
+    const ev = await evaluate(hooks, fixture.event)
     assert.equal(calls.review, 1, command)
     assert.equal(ev.effect, "deny", command)
   }
@@ -96,9 +108,10 @@ await test("non-ASCII text and cmd escapes reach the reviewer", async () => {
   // PowerShell reads .env for the curly-quote forms; cmd.exe reads it for `.en^v`.
   const commands = ["gc .e“nv”", "gc .en‘v’", "Get-Content .e“n”v", "type .en^v", "cat 说明.md"]
   for (const command of commands) {
-    const { ctx, hooks, calls } = makeCtx({ verdicts: [BLOCK] })
+    const fixture = shellFixture({ command }, [command])
+    const { ctx, hooks, calls } = makeCtx({ messages: fixture.messages, verdicts: [BLOCK] })
     await plugin.setup(ctx)
-    const ev = await evaluate(hooks, { action: "shell", resources: [command] })
+    const ev = await evaluate(hooks, fixture.event)
     assert.equal(calls.review, 1, command)
     assert.equal(ev.effect, "deny", command)
   }
@@ -116,9 +129,12 @@ await test("credential-like names prevent read and shell whitelisting", async ()
     { action: "read", resource: ".aws/config" }, { action: "read", resource: ".gnupg/pubring.kbx" },
   ]
   for (const { action, resource } of cases) {
-    const { ctx, hooks, calls } = makeCtx({ verdicts: [BLOCK] })
+    const fixture = action === "shell"
+      ? shellFixture({ command: resource }, [resource])
+      : { messages: [], event: { action, resources: [resource] } }
+    const { ctx, hooks, calls } = makeCtx({ messages: fixture.messages, verdicts: [BLOCK] })
     await plugin.setup(ctx)
-    assert.equal((await evaluate(hooks, { action, resources: [resource] })).effect, "deny", resource)
+    assert.equal((await evaluate(hooks, fixture.event)).effect, "deny", resource)
     assert.equal(calls.review, 1, resource)
   }
 })
@@ -132,9 +148,10 @@ await test("supported read-only shell forms skip review and preserve ask", async
     "git remote", "git remote -v", "git ls-files", "git rev-parse HEAD", "git describe --tags",
   ]
   for (const command of commands) {
-    const { ctx, hooks, calls } = makeCtx({ verdicts: [BLOCK] })
+    const fixture = shellFixture({ command }, [command])
+    const { ctx, hooks, calls } = makeCtx({ messages: fixture.messages, verdicts: [BLOCK] })
     await plugin.setup(ctx)
-    const ev = await evaluate(hooks, { action: "shell", resources: [command], effect: "ask" })
+    const ev = await evaluate(hooks, { ...fixture.event, effect: "ask" })
     assert.equal(calls.review, 0, command)
     assert.equal(ev.effect, "ask", command)
   }
@@ -243,9 +260,12 @@ await test("empty whitelist arrays disable each whitelist independently", async 
     { whitelist: { gitReadSubcommands: [] }, action: "shell", resources: ["git status"] },
   ]
   for (const { whitelist, action, resources } of cases) {
-    const { ctx, hooks, calls } = makeCtx({ options: { whitelist }, verdicts: [BLOCK] })
+    const fixture = action === "shell"
+      ? shellFixture({ command: resources[0] }, resources)
+      : { messages: [], event: { action, resources } }
+    const { ctx, hooks, calls } = makeCtx({ messages: fixture.messages, options: { whitelist }, verdicts: [BLOCK] })
     await plugin.setup(ctx)
-    assert.equal((await evaluate(hooks, { action, resources })).effect, "deny", JSON.stringify(whitelist))
+    assert.equal((await evaluate(hooks, fixture.event)).effect, "deny", JSON.stringify(whitelist))
     assert.equal(calls.review, 1, JSON.stringify(whitelist))
   }
 })
@@ -465,6 +485,201 @@ await test("expired granted release is reviewed again", async () => {
   } finally {
     Date.now = now
   }
+})
+
+await test("parsed shell resources cannot hide a redirect or compound command", async () => {
+  // The redirect fixture is in OpenCode v2.0.27's shell-scan/redirect.test.ts.
+  // Do not replace these resource fragments with the complete command in this test.
+  const fixtures = [
+    { command: "pwd && cat > output file", resources: ["pwd", "cat"] },
+    { command: "pwd && ls", resources: ["pwd", "ls"] },
+  ]
+  for (const action of ["shell", "bash"]) {
+    for (const { command, resources } of fixtures) {
+      const fixture = shellFixture({ command, workdir: "/workspace" }, resources, action)
+      const { ctx, hooks, calls, prompts } = makeCtx({ messages: fixture.messages, verdicts: [BLOCK] })
+      await plugin.setup(ctx)
+      assert.equal((await evaluate(hooks, fixture.event)).effect, "deny")
+      assert.equal(calls.review, 1)
+      assert.ok(prompts[0].includes(command), "reviewer receives the complete command")
+    }
+  }
+})
+
+await test("a shell whitelist requires a matching single resource and a non-sensitive workdir", async () => {
+  for (const resources of [[], ["cat"], ["pwd", "pwd"]]) {
+    const fixture = shellFixture({ command: "pwd" }, resources)
+    const { ctx, hooks, calls } = makeCtx({ messages: fixture.messages, verdicts: [BLOCK] })
+    await plugin.setup(ctx)
+    assert.equal((await evaluate(hooks, fixture.event)).effect, "deny")
+    assert.equal(calls.review, 1)
+  }
+  const fixture = shellFixture({ command: "cat config", workdir: "/home/user/.aws" }, ["cat config"])
+  const { ctx, hooks, calls, prompts } = makeCtx({ messages: fixture.messages, verdicts: [BLOCK] })
+  await plugin.setup(ctx)
+  assert.equal((await evaluate(hooks, fixture.event)).effect, "deny")
+  assert.equal(calls.review, 1)
+  assert.ok(prompts[0].includes("/home/user/.aws"))
+})
+
+await test("missing or malformed shell input cannot whitelist or offer a release, even with metadata", async () => {
+  const inputs = [undefined, null, "pwd", {}, { command: 7 }, { command: "" }, { command: "  " }, { script: "pwd" }]
+  const variants = [
+    { action: "shell", options: {} },
+    { action: "bash", options: {} },
+    { action: "shell", options: { whitelist: { shellActions: [] } } },
+    { action: "run_shell", options: { whitelist: { shellActions: ["run_shell"] } } },
+  ]
+  for (const { action, options } of variants) {
+    for (const input of inputs) {
+      const fixture = shellFixture(input, ["pwd"], action)
+      const { ctx, hooks, calls, prompts } = makeCtx({ messages: fixture.messages, verdicts: [BLOCK], options })
+      await plugin.setup(ctx)
+      const ev = await evaluate(hooks, { ...fixture.event, metadata: { note: "not a complete command" } })
+      assert.equal(ev.effect, "deny")
+      assert.equal(calls.review, 1)
+      assert.equal(idOf(ev.message), undefined, "generic metadata must not pin an incomplete shell call")
+      assert.ok(prompts[0].includes("Permission resources may be parsed fragments"))
+    }
+  }
+})
+
+await test("unrecoverable shell sources and failed transcript lookups cannot bypass review", async () => {
+  for (const failure of ["no-source", "wrong-message", "wrong-tool", "lookup-error"]) {
+    const fixture = shellFixture({ command: "pwd" }, ["pwd"])
+    const { ctx, hooks, calls } = makeCtx({ messages: fixture.messages, verdicts: [BLOCK] })
+    const source = failure === "no-source" ? undefined : {
+      ...fixture.event.source,
+      messageID: failure === "wrong-message" ? "missing" : "m1",
+      id: failure === "wrong-tool" ? "missing" : "t1",
+    }
+    if (failure === "lookup-error") ctx.session.context = async () => { throw new Error("offline") }
+    await plugin.setup(ctx)
+    const ev = await evaluate(hooks, { ...fixture.event, source })
+    assert.equal(ev.effect, "deny", failure)
+    assert.equal(calls.review, 1, failure)
+    assert.equal(idOf(ev.message), undefined, failure)
+  }
+})
+
+await test("shell input is recovered once before whitelisting; reads and prior denies need no context", async () => {
+  const fixture = shellFixture({ command: "pwd", workdir: "/workspace" }, ["pwd"], "bash")
+  const { ctx, hooks, calls } = makeCtx({ messages: fixture.messages, verdicts: [BLOCK] })
+  let lookups = 0
+  ctx.session.context = async () => { lookups++; return fixture.messages }
+  await plugin.setup(ctx)
+  assert.equal((await evaluate(hooks, { ...fixture.event, effect: "deny" })).effect, "deny")
+  assert.equal((await evaluate(hooks, { action: "read", resources: ["README.md"] })).effect, "allow")
+  assert.equal((await evaluate(hooks, { action: "question", resources: ["*"] })).effect, "allow")
+  assert.equal(lookups, 0)
+  assert.equal((await evaluate(hooks, { ...fixture.event, effect: "ask" })).effect, "ask")
+  assert.equal(lookups, 1)
+  assert.equal(calls.review, 0)
+})
+
+await test("shell release binds the full redirect target and workdir, and is consumed only once", async () => {
+  const command = "printf hello | cat > scratch"
+  const resources = ["printf hello", "cat"]
+  for (const action of ["shell", "bash"]) {
+    const original = shellFixture({ command, workdir: "/workspace/a" }, resources, action)
+    const { ctx, hooks, calls } = makeCtx({ messages: original.messages, verdicts: Array(8).fill(BLOCK) })
+    await plugin.setup(ctx)
+    const id = idOf((await evaluate(hooks, original.event)).message)
+    assert.ok(id)
+    const label = `Approve [release-request:${id}]`
+    await answer(hooks, question([label, "Cancel"]), [label])
+    for (const input of [
+      { command: "printf hello | cat > other", workdir: "/workspace/a" },
+      { command, workdir: "/workspace/b" },
+    ]) {
+      const changed = shellFixture(input, resources, action)
+      ctx.session.context = async () => changed.messages
+      const ev = await evaluate(hooks, changed.event)
+      assert.equal(ev.effect, "deny")
+      assert.ok(idOf(ev.message))
+      assert.notEqual(idOf(ev.message), id)
+    }
+    // A real retry has a new message/tool-call ID, but identical input is still the approved operation.
+    const retry = shellFixture({ command, workdir: "/workspace/a" }, resources, action)
+    retry.messages[0].id = "m2"
+    retry.messages[0].content[0].id = "t2"
+    retry.event.source = { type: "tool", messageID: "m2", id: "t2" }
+    ctx.session.context = async () => retry.messages
+    const count = calls.review
+    const retries = await Promise.all(Array.from({ length: 4 }, () => evaluate(hooks, { ...retry.event, effect: "ask" })))
+    assert.equal(retries.filter((ev) => ev.effect === "ask").length, 1)
+    assert.equal(retries.filter((ev) => ev.effect === "deny").length, 3)
+    assert.equal(calls.review, count + 3)
+  }
+})
+
+await test("losing shell input cannot consume an existing release using resource fragments", async () => {
+  const fixture = shellFixture({ command: "printf hello | cat > scratch" }, ["printf hello", "cat"])
+  const { ctx, hooks, calls } = makeCtx({ messages: fixture.messages, verdicts: [BLOCK, BLOCK] })
+  await plugin.setup(ctx)
+  const id = idOf((await evaluate(hooks, fixture.event)).message)
+  assert.ok(id)
+  const label = `Approve [release-request:${id}]`
+  await answer(hooks, question([label, "Cancel"]), [label])
+  ctx.session.context = async () => []
+  const missing = await evaluate(hooks, fixture.event)
+  assert.equal(missing.effect, "deny")
+  assert.equal(idOf(missing.message), undefined)
+  ctx.session.context = async () => fixture.messages
+  assert.equal((await evaluate(hooks, fixture.event)).effect, "allow")
+  assert.equal(calls.review, 2, "the original release was not consumed by the incomplete call")
+})
+
+await test("non-allow verdicts require nonempty description and reason, or use onReviewError", async () => {
+  const fields = [
+    {}, { description: "d" }, { reason: "r" },
+    { description: " ", reason: "r" }, { description: "d", reason: "\n" },
+    { description: 7, reason: "r" }, { description: "d", reason: null },
+  ]
+  for (const decision of ["block", "uncertain"]) {
+    for (const effect of ["ask", "deny"]) {
+      for (const field of fields) {
+        const { ctx, hooks, calls } = makeCtx({
+          verdicts: [JSON.stringify({ decision, ...field })], options: { onReviewError: effect },
+        })
+        await plugin.setup(ctx)
+        const ev = await evaluate(hooks, editEvent("+x"))
+        assert.equal(ev.effect, effect)
+        assert.equal(calls.review, 1)
+        assert.ok(ev.message?.includes("Pre-tool review could not run"))
+        assert.equal(idOf(ev.message), undefined)
+      }
+    }
+  }
+})
+
+await test("a malformed non-allow verdict tries fallback; a valid block never does", async () => {
+  for (const decision of ["block", "uncertain"]) {
+    const { ctx, hooks, calls } = makeCtx({
+      verdicts: [JSON.stringify({ decision }), BLOCK], options: { models: { primary: "p/a", fallback: "f/b" } },
+    })
+    await plugin.setup(ctx)
+    const ev = await evaluate(hooks, editEvent("+x"))
+    assert.equal(ev.effect, "deny")
+    assert.equal(calls.review, 2)
+    assert.ok(ev.message?.includes("[fallback reviewer]"))
+    assert.ok(idOf(ev.message))
+  }
+  const { ctx, hooks, calls } = makeCtx({
+    verdicts: [BLOCK, '{"decision":"allow"}'], options: { models: { primary: "p/a", fallback: "f/b" } },
+  })
+  await plugin.setup(ctx)
+  assert.equal((await evaluate(hooks, editEvent("+x"))).effect, "deny")
+  assert.equal(calls.review, 1)
+})
+
+await test("minimal allow verdicts remain valid and preserve native ask", async () => {
+  const { ctx, hooks, calls } = makeCtx({ verdicts: ['{"decision":"allow"}'] })
+  await plugin.setup(ctx)
+  const ev = await evaluate(hooks, { ...editEvent("+x"), effect: "ask" })
+  assert.equal(ev.effect, "ask")
+  assert.equal(ev.message, undefined)
+  assert.equal(calls.review, 1)
 })
 
 console.log(results.join("\n"))

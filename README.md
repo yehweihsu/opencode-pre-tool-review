@@ -164,7 +164,9 @@ blocking behavior on uncertainty or reviewer failures, set `onUncertain` and `on
 `"deny"` as well.
 
 A fallback reviewer is optional. It runs only when the primary request fails, times out or its
-response cannot be parsed; a primary `block` never retries against the fallback.
+response is invalid; a valid primary `block` never retries against the fallback. `block` and
+`uncertain` responses must include nonempty `description` and `reason` strings; missing fields
+count as an invalid response, not as a releasable block. `{"decision":"allow"}` remains valid.
 
 ## Options
 
@@ -186,7 +188,7 @@ All options except `models.primary` are optional.
 | `recentUserMessages` | positive number | `3` | Number of recent user messages included. |
 | `whitelist.readOnlyActions` | string[] | `["read", "glob", "grep"]` | Read-only permission actions that skip review unless resources look sensitive. |
 | `whitelist.interactiveActions` | string[] | `["question"]` | Interactive permission actions that skip review. |
-| `whitelist.shellActions` | string[] | `["shell", "bash"]` | Actions whose resources are checked as shell commands. |
+| `whitelist.shellActions` | string[] | `["shell", "bash"]` | Actions eligible for shell whitelisting; requires a recovered full `command` matching a single permission resource. |
 | `whitelist.shellVerbs` | string[] | See `DEFAULT_SHELL_VERBS` in [source](src/index.ts) | Permitted shell verbs, subject to syntax/argument checks. |
 | `whitelist.gitReadSubcommands` | string[] | See `DEFAULT_GIT_READ_SUBCOMMANDS` in [source](src/index.ts) | Permitted Git subcommands, subject to argument checks. |
 
@@ -211,6 +213,11 @@ Place this object inside the plugin's `options`.
 Whitelisted operations skip model calls but still honor the existing OpenCode permission effect.
 Shell matching is deliberately narrow:
 
+- The full `command` must be recovered from the tool input before a shell call can skip review,
+  and it must match one permission resource (ignoring surrounding whitespace). OpenCode can split
+  commands into resources and omit operators or redirect targets: `pwd && cat > output file`, for
+  example, can arrive as `["pwd", "cat"]`. Those fragments alone never justify skipping review.
+  Missing or malformed tool input goes to review, even for an apparently read-only resource.
 - A command must be a single, unquoted command, without chaining, pipes, redirection, substitution,
   comments or other recognized shell syntax, including cmd's `^` escape. Paths containing
   separators, `:` (drive letters, PowerShell provider paths such as `env:`), `..` or `~` go to
@@ -228,8 +235,9 @@ Shell matching is deliberately narrow:
   whitelisting. See `SENSITIVE` in the [source](src/index.ts) for the full list; it is a heuristic,
   so add OpenCode `read` rules for credential files it does not recognize. For `glob` and `grep`,
   only the resource pattern is checked; a broad search can still surface credential files.
+  An explicitly supplied shell `workdir` with a sensitive name also prevents shell whitelisting.
 
-Examples with the default lists:
+Examples with the default lists, when the full tool input is recoverable:
 
 | Command | Reviewed? |
 | --- | --- |
@@ -241,6 +249,7 @@ Examples with the default lists:
 | `date --set=20261012`, `hostname renamed`, `cat .env` | Yes |
 | `cat .e*`, `gc env:API_KEY`, `ls env:`, `git show HEAD:config.json` | Yes |
 | `gc .e“nv”`, `type .en^v`, `cat id_ecdsa` | Yes |
+| `pwd && cat > output file`, `pwd && ls` | Yes |
 
 This matching does not inspect shell functions, executable replacements or Git configuration,
 which can alter the behavior of an otherwise ordinary command. Disable the relevant lists when
@@ -265,9 +274,12 @@ selecting cancel, typing a different answer, or omitting the reviewer's descript
 The operation ID includes the session, action, resources, metadata and recovered tool input.
 Different edits or MCP inputs do not share a release. The ID is an HMAC-SHA-256 under a random key
 held by the plugin instance, so the agent cannot compute IDs or search for a different operation
-that shares an approved one. A call that cannot be identified beyond its
-resources is not offered a release, except shell actions whose resources already contain the
-command. Existing deny decisions cannot be bypassed by a release.
+that shares an approved one. A call that cannot be identified beyond its resources is not offered
+a release. Shell actions additionally require a recovered, nonempty `command`; parsed resources
+or arbitrary permission metadata are not enough. The full recovered input is hashed without
+truncation, including the command's redirect targets and any supplied `workdir`. Changing either
+requires a new review. Disabling shell whitelisting does not relax this release requirement for
+built-in `shell` and `bash` actions. Existing deny decisions cannot be bypassed by a release.
 
 Pending requests and granted releases expire after `releaseTtlMs`. They live in memory in one
 plugin instance and are discarded on plugin reload or server restart. A different session or
@@ -305,7 +317,10 @@ npm pack --dry-run
 The scenarios cover unsafe shell arguments (including Unicode quotes and cmd escapes), credential
 names, read-only forms, empty whitelist configuration, metadata delivery/truncation, user-message
 budgets, subagent sessions, reviewer timeouts, and release approval, concurrency, session
-isolation, expiry and reload behavior. The test suite can also run with `bun test/plugin.test.ts`.
+isolation, expiry and reload behavior. Shell regressions cover upstream resource fragments,
+missing/malformed input, redirect-target and workdir identity, and recovery before whitelisting.
+Verdict tests distinguish malformed non-allow responses from valid blocks and minimal allows.
+The test suite can also run with `bun test/plugin.test.ts`.
 
 [GitHub Actions](.github/workflows/ci.yml) is configured to run the Node.js checks on Linux and
 Windows. The package ships the TypeScript source, README and MIT license; no generated build
@@ -321,7 +336,10 @@ reviewer provider:
 3. Try a non-whitelisted operation on a disposable file and verify that it reaches the reviewer.
    Model decisions can vary; use the mocked tests for deterministic allow/block expectations.
 4. Temporarily select an unavailable reviewer model with no fallback and verify the configured
-   `onReviewError` behavior.
+   `onReviewError` behavior. While that unavailable model is selected, try the exact shell command
+   `pwd && cat > output file` in a disposable directory containing a harmless file named `file`.
+   Set `onReviewError: "deny"` for this check: review must be attempted, and `output` must not be
+   created or overwritten. Restore the real reviewer and your normal options afterwards.
 5. When a reviewer block offers a release, confirm that cancel leaves it blocked and approval permits
    a single identical retry in that session. Repeating a call after consumption must review again.
 
