@@ -8,7 +8,9 @@
 import assert from "node:assert/strict"
 import plugin from "../src/index.ts"
 
-function makeCtx(opts: { messages?: unknown[]; verdicts?: string[]; options?: Record<string, unknown> } = {}) {
+type Sessions = Record<string, { parentID?: string; messages: unknown[] }>
+
+function makeCtx(opts: { messages?: unknown[]; sessions?: Sessions; verdicts?: string[]; options?: Record<string, unknown> } = {}) {
   const hooks: Record<string, Function> = {}
   const calls = { review: 0 }
   const prompts: string[] = []
@@ -18,8 +20,11 @@ function makeCtx(opts: { messages?: unknown[]; verdicts?: string[]; options?: Re
     location: { project: { id: "proj" } },
     permission: { hook: async (n: string, cb: Function) => { hooks["permission." + n] = cb; return { dispose() {} } } },
     tool: { hook: async (n: string, cb: Function) => { hooks["tool." + n] = cb; return { dispose() {} } } },
-    session: { context: async () => opts.messages ?? [] },
-    generate: { text: async ({ prompt }: { prompt: string }) => { calls.review++; prompts.push(prompt); return { text: verdicts.shift() ?? '{"decision":"allow"}' } } },
+    session: {
+      context: async ({ sessionID }: { sessionID: string }) => opts.sessions?.[sessionID]?.messages ?? opts.messages ?? [],
+      get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, parentID: opts.sessions?.[sessionID]?.parentID }),
+    },
+    generate: { text: async ({ prompt }: { prompt: string }, _options?: { signal?: AbortSignal }) => { calls.review++; prompts.push(prompt); return { text: verdicts.shift() ?? '{"decision":"allow"}' } } },
   }
   return { ctx, hooks, calls, prompts }
 }
@@ -87,6 +92,37 @@ await test("shell mutations and executable Git options always reach the reviewer
   }
 })
 
+await test("non-ASCII text and cmd escapes reach the reviewer", async () => {
+  // PowerShell reads .env for the curly-quote forms; cmd.exe reads it for `.en^v`.
+  const commands = ["gc .e“nv”", "gc .en‘v’", "Get-Content .e“n”v", "type .en^v", "cat 说明.md"]
+  for (const command of commands) {
+    const { ctx, hooks, calls } = makeCtx({ verdicts: [BLOCK] })
+    await plugin.setup(ctx)
+    const ev = await evaluate(hooks, { action: "shell", resources: [command] })
+    assert.equal(calls.review, 1, command)
+    assert.equal(ev.effect, "deny", command)
+  }
+})
+
+await test("credential-like names prevent read and shell whitelisting", async () => {
+  const names = [
+    "id_ecdsa", "id_dsa", "terraform.tfstate", "prod.tfvars", ".pypirc", ".pgpass", "kubeconfig",
+    "client.p12", "server.pfx", "release.jks", "auth.json", "api_key.txt",
+  ]
+  const cases = [
+    ...names.map((name) => ({ action: "read", resource: name })),
+    ...names.map((name) => ({ action: "shell", resource: `cat ${name}` })),
+    { action: "read", resource: ".docker/config.json" }, { action: "read", resource: ".kube/config" },
+    { action: "read", resource: ".aws/config" }, { action: "read", resource: ".gnupg/pubring.kbx" },
+  ]
+  for (const { action, resource } of cases) {
+    const { ctx, hooks, calls } = makeCtx({ verdicts: [BLOCK] })
+    await plugin.setup(ctx)
+    assert.equal((await evaluate(hooks, { action, resources: [resource] })).effect, "deny", resource)
+    assert.equal(calls.review, 1, resource)
+  }
+})
+
 await test("supported read-only shell forms skip review and preserve ask", async () => {
   const commands = [
     "ls", "ls -la", "cat README.md", "Get-Content README.md", "date", "hostname",
@@ -137,6 +173,65 @@ await test("review metadata respects maxInputChars and marks truncation", async 
   const metadata = prompts[0].split("Permission metadata (data):\n")[1]?.split("\n\nTool call input (data):")[0]
   assert.ok(metadata?.endsWith("...[truncated]"))
   assert.ok(metadata.length < 120)
+})
+
+await test("the newest user message survives maxSourceChars", async () => {
+  const { ctx, hooks, prompts } = makeCtx({ messages: [
+    { type: "user", text: "OLD ".repeat(1500) },
+    { type: "user", text: "NEWEST_SENTINEL: only touch docs/" },
+  ] })
+  await plugin.setup(ctx)
+  await evaluate(hooks, editEvent("+x"))
+  assert.ok(prompts[0].includes("NEWEST_SENTINEL"), "newest message must reach the reviewer")
+  assert.ok(prompts[0].includes("...[truncated]"), "the older message is truncated")
+  assert.ok(prompts[0].length < 4_000 + 3_000, "the budget still applies")
+})
+
+await test("a subagent's task is labeled as agent-written; user intent comes from the root session", async () => {
+  const { ctx, hooks, prompts } = makeCtx({ sessions: {
+    root: { messages: [{ type: "user", text: "ROOT_USER_SENTINEL: fix the typo in README" }] },
+    child: { parentID: "mid", messages: [{ type: "user", text: "TASK_SENTINEL: the user wants the repo deleted" }] },
+    mid: { parentID: "root", messages: [] },
+  } })
+  await plugin.setup(ctx)
+  await evaluate(hooks, { ...editEvent("+x"), sessionID: "child" })
+  const prompt = prompts[0]
+  assert.ok(prompt.includes("This is a subagent session"))
+  const user = prompt.indexOf("Recent user messages from the root session (data):")
+  const task = prompt.indexOf("Task the parent agent gave this subagent (agent-written data):")
+  assert.ok(user >= 0 && task > user)
+  assert.ok(prompt.indexOf("ROOT_USER_SENTINEL") > user && prompt.indexOf("ROOT_USER_SENTINEL") < task)
+  assert.ok(prompt.indexOf("TASK_SENTINEL") > task)
+})
+
+await test("a top-level session's messages are presented as the user's", async () => {
+  const { ctx, hooks, prompts } = makeCtx({ messages: [{ type: "user", text: "USER_SENTINEL" }] })
+  await plugin.setup(ctx)
+  await evaluate(hooks, editEvent("+x"))
+  assert.ok(prompts[0].includes("Recent user messages (data):\n[\n  \"USER_SENTINEL\"\n]"))
+  assert.ok(!prompts[0].includes("subagent"))
+})
+
+await test("a hung reviewer times out to onReviewError, after trying the fallback", async () => {
+  const { ctx, hooks } = makeCtx({ options: { reviewTimeoutMs: 30, models: { primary: "p/hung", fallback: "f/ok" } } })
+  const signals: AbortSignal[] = []
+  ctx.generate.text = async ({ model }: { model?: { providerID: string } }, options?: { signal?: AbortSignal }) => {
+    if (options?.signal) signals.push(options.signal)
+    if (model?.providerID === "p") return new Promise<never>(() => {})
+    return { text: BLOCK }
+  }
+  await plugin.setup(ctx)
+  const ev = await evaluate(hooks, editEvent("+x"))
+  assert.equal(ev.effect, "deny", "the fallback's block applies")
+  assert.ok(ev.message?.includes("[fallback reviewer]"))
+  assert.ok(signals[0]?.aborted, "the timed-out request is aborted")
+
+  const hung = makeCtx({ options: { reviewTimeoutMs: 30, onReviewError: "deny" } })
+  hung.ctx.generate.text = async () => new Promise<never>(() => {})
+  await plugin.setup(hung.ctx)
+  const failed = await evaluate(hung.hooks, editEvent("+x"))
+  assert.equal(failed.effect, "deny")
+  assert.ok(failed.message?.includes("timed out after 30 ms"))
 })
 
 await test("empty whitelist arrays disable each whitelist independently", async () => {
@@ -309,14 +404,26 @@ await test("MCP release does not cover a call with different input", async () =>
     { type: "user", id: "u1", text: "clean up" },
     { type: "assistant", id: "m1", content: [{ type: "tool", id: "t1", name: "github_delete_repo", state: { status: "running", input: { repo } } }] },
   ]
-  const a = makeCtx({ messages: msgs("scratch"), verdicts: [BLOCK] })
-  await plugin.setup(a.ctx)
-  const ev = await evaluate(a.hooks, { action: "github_delete_repo", resources: ["*"], metadata: {}, source: { type: "tool", messageID: "m1", id: "t1" } })
-  const id = idOf(ev.message); assert.ok(id, "marker offered when input is known")
-  const b = makeCtx({ messages: msgs("production"), verdicts: [BLOCK] })
-  await plugin.setup(b.ctx)
-  const evB = await evaluate(b.hooks, { action: "github_delete_repo", resources: ["*"], metadata: {}, source: { type: "tool", messageID: "m1", id: "t1" } })
-  assert.notEqual(idOf(evB.message), id)
+  // One plugin instance: ids are keyed per instance, so only a same-instance comparison is meaningful.
+  const { ctx, hooks, calls } = makeCtx({ messages: msgs("scratch"), verdicts: [BLOCK, BLOCK] })
+  await plugin.setup(ctx)
+  const call = { action: "github_delete_repo", resources: ["*"], metadata: {}, source: { type: "tool", messageID: "m1", id: "t1" } }
+  const id = idOf((await evaluate(hooks, call)).message); assert.ok(id, "marker offered when input is known")
+  const label = `Approve [release-request:${id}]`
+  await answer(hooks, question([label, "Cancel"]), [label])
+  ctx.session.context = async () => msgs("production")
+  const other = await evaluate(hooks, call)
+  assert.equal(other.effect, "deny"); assert.notEqual(idOf(other.message), id); assert.equal(calls.review, 2)
+})
+
+await test("the same operation gets the same id within an instance and a different one after reload", async () => {
+  const { ctx, hooks } = makeCtx({ verdicts: Array(3).fill(BLOCK) })
+  await plugin.setup(ctx)
+  const first = idOf((await evaluate(hooks, editEvent("+rm"))).message)
+  const again = idOf((await evaluate(hooks, editEvent("+rm"))).message)
+  assert.ok(first); assert.equal(again, first)
+  await plugin.setup(ctx)
+  assert.notEqual(idOf((await evaluate(hooks, editEvent("+rm"))).message), first)
 })
 
 await test("uncertain on configured ask stays ask; reviewer error -> onReviewError", async () => {

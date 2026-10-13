@@ -112,7 +112,7 @@ reload before using the plugin normally. See [Manual validation](#manual-validat
 | Symptom | Meaning and next step |
 | --- | --- |
 | Error mentions `options.models.primary` during loading | The plugin has no valid model reference and its review hook is not registered. Use the object-form entry with a primary model. |
-| `Pre-tool review could not run` during an action | Model lookup, authentication, a request, or response parsing failed. Verify the exact ID and provider connection; the fallback is tried when configured. |
+| `Pre-tool review could not run` during an action | Model lookup, authentication, a request, or response parsing failed, or the request exceeded `reviewTimeoutMs`. Verify the exact ID and provider connection; the fallback is tried when configured. |
 | No extra dialog for a command | It may be whitelisted or allowed. Use a non-whitelisted scratch-file operation or the deliberate failure check above. |
 | Review errors still let a run continue | `onReviewError` defaults to `ask`, which is subject to auto-accept. Set it to `deny` if failures must stop execution. It only applies after successful plugin initialization. |
 | A delete is allowed | Explicitly requested cleanup can be legitimate. The reviewer judges the action against user intent; it does not reject every deletion. |
@@ -147,22 +147,24 @@ stay denied. For other checks:
    OpenCode's dialog.
 3. Otherwise, the reviewer receives recent user messages, the permission action and resources,
    permission metadata (including edit diffs), and tool input recovered from the session when
-   available. Metadata is included even if input recovery fails.
+   available. Metadata is included even if input recovery fails. In a subagent session, the
+   messages that started the subagent were written by the parent agent, so the reviewer gets them
+   labeled as the parent agent's task and takes the user's intent from the root session.
 
 | Reviewer result | Permission effect |
 | --- | --- |
 | `allow` | Preserve the existing effect, including an existing `ask`. |
 | `block` | `onBlock`, default `deny`. |
 | `uncertain` | `onUncertain`, default `ask`. |
-| Request failure or invalid response | `onReviewError`, default `ask`. |
+| Request failure, timeout or invalid response | `onReviewError`, default `ask`. |
 
 A deny raises OpenCode's blocked error with the reviewer's description and reason. An ask uses
 OpenCode's native permission dialog and is subject to the client's auto-accept settings. For
 blocking behavior on uncertainty or reviewer failures, set `onUncertain` and `onReviewError` to
 `"deny"` as well.
 
-A fallback reviewer is optional. It runs only when the primary request fails or its response
-cannot be parsed; a primary `block` never retries against the fallback.
+A fallback reviewer is optional. It runs only when the primary request fails, times out or its
+response cannot be parsed; a primary `block` never retries against the fallback.
 
 ## Options
 
@@ -178,8 +180,9 @@ All options except `models.primary` are optional.
 | `onReviewError` | `"deny"` or `"ask"` | `"ask"` | Effect when review fails. |
 | `allowRelease` | boolean | `true` | Enable user-confirmed, one-time releases for reviewer blocks. |
 | `releaseTtlMs` | positive number | `600000` | Expiry for a pending request and, separately, its granted release. |
+| `reviewTimeoutMs` | positive number | `60000` | Time limit for each reviewer request. A timeout counts as a failed request: the fallback runs if configured, then `onReviewError`. |
 | `maxInputChars` | positive number | `12000` | Per-field character limit for resources, metadata and tool input. Truncation is marked. |
-| `maxSourceChars` | positive number | `4000` | Character limit for serialized recent user messages. |
+| `maxSourceChars` | positive number | `4000` | Character budget for recent user messages, filled from the newest message back. Older messages are truncated or omitted, and this is marked. A subagent's task gets its own budget. |
 | `recentUserMessages` | positive number | `3` | Number of recent user messages included. |
 | `whitelist.readOnlyActions` | string[] | `["read", "glob", "grep"]` | Read-only permission actions that skip review unless resources look sensitive. |
 | `whitelist.interactiveActions` | string[] | `["question"]` | Interactive permission actions that skip review. |
@@ -209,17 +212,22 @@ Whitelisted operations skip model calls but still honor the existing OpenCode pe
 Shell matching is deliberately narrow:
 
 - A command must be a single, unquoted command, without chaining, pipes, redirection, substitution,
-  comments or other recognized shell syntax. Paths containing separators, `:` (drive letters,
-  PowerShell provider paths such as `env:`), `..` or `~` go to review, and so do wildcards `*` and
-  `?`, except in a `git branch --list` pattern.
+  comments or other recognized shell syntax, including cmd's `^` escape. Paths containing
+  separators, `:` (drive letters, PowerShell provider paths such as `env:`), `..` or `~` go to
+  review, and so do wildcards `*` and `?`, except in a `git branch --list` pattern.
+- A command must be plain printable ASCII. Any other character goes to review: PowerShell treats
+  curly quotes such as `“ ”` and `‘ ’` as quotes, so `gc .e“nv”` reads `.env`. Commands that name
+  files with non-ASCII names are therefore reviewed too.
 - Known Git subcommands accept only recognized read-only flags. Unknown flags go to review.
   `git branch` allows listing forms; a positional pattern requires `--list` or `-l`.
   `git remote` allows only listing, optionally with `-v` or `--verbose`.
 - `date` and `hostname` skip review only without arguments. Custom shell verbs and custom Git
   subcommands skip review only without arguments.
-- Credential-like resource names such as `.env`, `.ssh`, `id_rsa`, `.pem`, `.npmrc` and `token`
-  prevent read/shell whitelisting. For `glob` and `grep`, only the resource pattern is checked;
-  a broad search can still surface credential files.
+- Credential-like resource names such as `.env`, `.ssh`, `id_rsa`, `id_ecdsa`, `.pem`, `.p12`,
+  `.npmrc`, `.pypirc`, `kubeconfig`, `.tfstate`, `auth.json` and `token` prevent read/shell
+  whitelisting. See `SENSITIVE` in the [source](src/index.ts) for the full list; it is a heuristic,
+  so add OpenCode `read` rules for credential files it does not recognize. For `glob` and `grep`,
+  only the resource pattern is checked; a broad search can still surface credential files.
 
 Examples with the default lists:
 
@@ -232,6 +240,7 @@ Examples with the default lists:
 | `git diff --output=artifact`, `git diff --ext-diff`, `git show --textconv` | Yes |
 | `date --set=20261012`, `hostname renamed`, `cat .env` | Yes |
 | `cat .e*`, `gc env:API_KEY`, `ls env:`, `git show HEAD:config.json` | Yes |
+| `gc .e“nv”`, `type .en^v`, `cat id_ecdsa` | Yes |
 
 This matching does not inspect shell functions, executable replacements or Git configuration,
 which can alter the behavior of an otherwise ordinary command. Disable the relevant lists when
@@ -254,7 +263,9 @@ Exactly one option in the question call may contain a marker. Tagging both appro
 selecting cancel, typing a different answer, or omitting the reviewer's description grants nothing.
 
 The operation ID includes the session, action, resources, metadata and recovered tool input.
-Different edits or MCP inputs do not share a release. A call that cannot be identified beyond its
+Different edits or MCP inputs do not share a release. The ID is an HMAC-SHA-256 under a random key
+held by the plugin instance, so the agent cannot compute IDs or search for a different operation
+that shares an approved one. A call that cannot be identified beyond its
 resources is not offered a release, except shell actions whose resources already contain the
 command. Existing deny decisions cannot be bypassed by a release.
 
@@ -291,9 +302,10 @@ npm run typecheck
 npm pack --dry-run
 ```
 
-The scenarios cover unsafe shell arguments, read-only forms, empty whitelist configuration,
-metadata delivery/truncation, and release approval, concurrency, session isolation, expiry and
-reload behavior. The test suite can also run with `bun test/plugin.test.ts`.
+The scenarios cover unsafe shell arguments (including Unicode quotes and cmd escapes), credential
+names, read-only forms, empty whitelist configuration, metadata delivery/truncation, user-message
+budgets, subagent sessions, reviewer timeouts, and release approval, concurrency, session
+isolation, expiry and reload behavior. The test suite can also run with `bun test/plugin.test.ts`.
 
 [GitHub Actions](.github/workflows/ci.yml) is configured to run the Node.js checks on Linux and
 Windows. The package ships the TypeScript source, README and MIT license; no generated build
